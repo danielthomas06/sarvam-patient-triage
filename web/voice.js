@@ -28,10 +28,47 @@ const _SpeechRecognitionCtor = window.SpeechRecognition || window.webkitSpeechRe
 const VOICE_INPUT_POSSIBLE = !!(_SpeechRecognitionCtor ||
   (navigator.mediaDevices && navigator.mediaDevices.getUserMedia));
 
-function speak(text) {
+function speak(text, lang) {
   if (!window.speechSynthesis || !text) return;
   window.speechSynthesis.cancel();   // don't stack utterances if called again quickly
-  window.speechSynthesis.speak(new SpeechSynthesisUtterance(text));
+  const u = new SpeechSynthesisUtterance(text);
+  if (lang) u.lang = lang;           // the browser picks a matching voice if it has one
+  window.speechSynthesis.speak(u);
+}
+
+// A question in the patient's own language, spoken by the server's
+// text-to-speech (Sarvam Bulbul) -- far better Indian-language voices than a
+// browser usually has, and cached server-side so a question asked of many
+// patients is only ever synthesised once. Falls back to the browser's own
+// voice if the server can't (no key, rate limit, offline): a worse voice
+// beats silence for someone who can't read the screen. `ref` ties the request
+// to a live session so this can't be used as an open text-to-speech proxy.
+let _spoken = null;
+
+function stopSpeaking() {
+  if (_spoken) { _spoken.pause(); _spoken = null; }
+  if (window.speechSynthesis) window.speechSynthesis.cancel();
+}
+
+async function speakNative(ref, text, lang) {
+  stopSpeaking();
+  if (!text) return false;
+  try {
+    const r = await fetch("/api/tts", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ref, text, language: lang }),
+    });
+    if (!r.ok) throw new Error("tts " + r.status);
+    const url = URL.createObjectURL(await r.blob());
+    const audio = new Audio(url);
+    audio.onended = () => URL.revokeObjectURL(url);
+    _spoken = audio;
+    await audio.play();
+    return true;
+  } catch {
+    speak(text, lang);
+    return false;
+  }
 }
 
 // ---------------------------------------------------- tier 2: local record
@@ -95,8 +132,13 @@ class _LocalRecorder {
   }
 }
 
-async function _transcribeLocally(blob) {
-  const r = await fetch("/api/transcribe", { method: "POST", body: blob });
+// Sarvam's REST speech-to-text refuses audio past 30 seconds (HTTP 422); stop
+// recording a little before that rather than lose an answer at the very end.
+const MAX_RECORD_MS = 28000;
+
+async function _transcribeLocally(blob, lang) {
+  const r = await fetch(`/api/transcribe?lang=${encodeURIComponent(lang || "en-IN")}`,
+                        { method: "POST", body: blob });
   const data = await r.json();
   if (!r.ok) throw new Error(data.error || "local transcription failed");
   return data.text || "";
@@ -160,6 +202,14 @@ function attachVoiceInput(button, field, opts = {}) {
   let recording = false;
   let useFallback = !_SpeechRecognitionCtor;
   let baseText = "";
+  let mode = null;          // "native" | "server" -- how THIS recording is being captured
+  let autoStop = null;
+  // The patient's language is read at click time, not wired once: the kiosk's
+  // picker, or a nurse switching a patient's language, changes it between
+  // clicks. Anything but English skips the browser's recogniser entirely and
+  // goes to the server (Sarvam), which hears Indian languages far better
+  // than the browser does -- and, unlike English, has no local fallback.
+  const langOf = () => (opts.getLang ? opts.getLang() : "en-IN");
 
   function setState(state) {
     button.dataset.voiceState = state;   // "idle" | "listening" | "transcribing"
@@ -208,6 +258,7 @@ function attachVoiceInput(button, field, opts = {}) {
     try {
       recognition.start();
       recording = true;
+      mode = "native";
       setState("listening");
     } catch {
       useFallback = true;
@@ -221,7 +272,9 @@ function attachVoiceInput(button, field, opts = {}) {
       await recorder.start();
       baseText = field.value ? field.value + " " : "";
       recording = true;
+      mode = "server";
       setState("listening");
+      autoStop = setTimeout(() => { if (recording && mode === "server") stopFallback(); }, MAX_RECORD_MS);
     } catch (e) {
       setState("idle");
       if (opts.onError) opts.onError("Microphone access failed: " + e.message);
@@ -229,26 +282,29 @@ function attachVoiceInput(button, field, opts = {}) {
   }
 
   async function stopFallback() {
+    clearTimeout(autoStop);
+    autoStop = null;
     setState("transcribing");
     try {
       const blob = await recorder.stop();
-      const text = await _transcribeLocally(blob);
+      const text = await _transcribeLocally(blob, langOf());
       apply(text);
       if (opts.onFinal) opts.onFinal(field.value);
     } catch (e) {
       if (opts.onError) opts.onError(e.message);
     } finally {
       recording = false;
+      mode = null;
       setState("idle");
     }
   }
 
   button.addEventListener("click", () => {
     if (recording) {
-      if (useFallback) stopFallback(); else recognition.stop();
+      if (mode === "server") stopFallback(); else recognition.stop();
       return;
     }
-    if (useFallback) startFallback(); else startNative();
+    if (useFallback || langOf() !== "en-IN") startFallback(); else startNative();
   });
 
   return { get recording() { return recording; } };

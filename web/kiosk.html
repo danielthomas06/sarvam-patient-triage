@@ -126,6 +126,15 @@
   @keyframes voicePulse { 0%, 100% { opacity:1; } 50% { opacity:.5; } }
   button.ghost.replay { color:var(--accent-ink); font-weight:600; }
 
+  .lang-row { display:flex; gap:10px; flex-wrap:wrap; }
+  button.lang-btn {
+    flex:1 1 calc(50% - 10px); width:auto; margin:0; padding:14px 10px; font-size:20px;
+    background:var(--surface-2); color:var(--ink); border:2px solid var(--line);
+  }
+  button.lang-btn[aria-pressed="true"] {
+    border-color:var(--accent); background:var(--accent-soft); color:var(--accent-ink);
+  }
+
   /* Photo capture -- deliberately plain: no preview of what a model made of
      it, no caption, no candidate check. That review only ever happens on the
      nurse screen; this page just confirms a photo was added. */
@@ -159,6 +168,16 @@
     <p class="eyebrow">Check-in</p>
     <h1>Welcome</h1>
     <p class="lead">A few details, then tell us what's bothering you. A nurse will see everything you enter here.</p>
+
+    <!-- Only shown when the server can actually hear, translate and speak
+         more than English (a Sarvam key is set) -- see /api/languages. The
+         labels are each language's own name in its own script, so someone
+         who can't read "Language" can still find theirs. -->
+    <div class="field" id="langPicker" hidden>
+      <label>Language &middot; भाषा &middot; மொழி &middot; ഭാഷ</label>
+      <div class="lang-row" id="langButtons"></div>
+    </div>
+
     <div class="err" id="errIdentity"></div>
 
     <div class="field">

@@ -294,7 +294,11 @@ DATA_PROTECTION = {
     "retention": "audit events retained per the NHS records retention schedule",
     "egress": (
         "the engine runs locally and never calls out. With the local model tier "
-        "no narrative leaves the building at all."
+        "no narrative leaves the building at all. EXCEPTION: a session in an "
+        "Indian language sends that patient's audio and text to Sarvam AI "
+        "(api.sarvam.ai, a third-party cloud) for transcription, translation "
+        "and speech; English sessions never do. Retention there is set per "
+        "workspace in Sarvam's dashboard, not by this system."
     ),
     "override_record": (
         "identifiable clinician, timestamp, recommended vs chosen, direction, "

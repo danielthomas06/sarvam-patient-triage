@@ -88,7 +88,7 @@ _STOP_WORDS = {"and", "i'm", "im", "i", "a", "an"}
 
 _AGE_MONTHS_RE = re.compile(r"(\d+(?:\.\d+)?)\s*months?\s*old\b", re.IGNORECASE)
 _AGE_YEARS_RE = re.compile(r"(\d+(?:\.\d+)?)\s*(?:years?\s*old|yo\b|years?)\b", re.IGNORECASE)
-_BARE_AGE_RE = re.compile(r"\bi'?m\s+(\d{1,3})\b", re.IGNORECASE)
+_BARE_AGE_RE = re.compile(r"\b(?:i'?m|i am)\s+(\d{1,3})\b", re.IGNORECASE)
 
 _SEX_WORDS = (
     (re.compile(r"\bfemale\b|\bwoman\b|\bgirl\b", re.IGNORECASE), "F"),

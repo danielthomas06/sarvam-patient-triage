@@ -16,6 +16,11 @@ models/
 ~$*.pdf
 6a7c763e089e4_aic_2026/
 
+# API keys live in environment variables, never in files -- but if someone
+# makes a .env anyway, it must not be committed.
+.env
+.env.*
+
 # Local server logs from manual testing
 serve.log
 *.log

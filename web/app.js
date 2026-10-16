@@ -182,7 +182,16 @@ function renderLedger() {
 }
 
 function renderTranscript() {
-  $("said").innerHTML = state.transcript.map(t => `<div class="said">${t}</div>`).join("");
+  // For a non-English patient the English line is a TRANSLATION, and a
+  // mistranslation is a new way to be wrong -- so the patient's own words are
+  // shown first, and the English is labelled as what the system worked from.
+  // Same boundary as everywhere else: the nurse can see exactly what was said
+  // and exactly what was understood, and disagree with either.
+  const native = state.transcript_native || [];
+  $("said").innerHTML = state.transcript.map((t, i) => native[i]
+    ? `<div class="said"><span lang="${state.language}">${native[i]}</span>` +
+      `<span class="said-en"><b>understood as</b> ${t}</span></div>`
+    : `<div class="said">${t}</div>`).join("");
   $("tCount").textContent = state.transcript.length +
     (state.transcript.length === 1 ? " utterance" : " utterances");
   $("cCount").textContent = state.checks.length +
@@ -220,6 +229,9 @@ function formatAge(years) {
 }
 
 function renderIdentity() {
+  if ($("p_lang").querySelector(`option[value="${state.language}"]`)) {
+    $("p_lang").value = state.language;
+  }
   const who = [];
   if (state.name) who.push(state.name);
   if (state.age !== null && state.age !== undefined) who.push(formatAge(state.age));
@@ -356,6 +368,10 @@ function renderNext() {
   // difference between a system that finished and a screen that went blank.
   $("nextQ").textContent = q || nextStep.stopped ||
     "Nothing further the patient can answer.";
+  // What the patient is actually being shown and told, when it isn't English.
+  $("nextNative").textContent = nextStep.question_native || "";
+  $("nextNative").hidden = !nextStep.question_native;
+  $("nextNative").lang = nextStep.language || "en-IN";
   // A text box only when there is something for the patient to reply to.
   $("answerBox").hidden = !q;
 
@@ -491,6 +507,7 @@ function renderIntake(rows) {
             <span class="in-w">${r.waited_minutes}m</span>
           </div>
           <span class="in-c">${r.label}${r.critical ? " — needs attention" : ""}</span>
+          ${r.untranslated ? '<span class="in-flag">Not translated — read their own words</span>' : ""}
           <div class="in-meta">${[
             r.age !== null && r.age !== undefined ? formatAge(r.age) : null,
             r.sex, `${r.checks_recorded} checks`,
@@ -721,11 +738,26 @@ $("ovDlg").addEventListener("close", async () => {
 function _voiceErr(button) {
   return (message) => { button.title = message; console.warn("voice:", message); };
 }
-attachVoiceInput($("voiceNarrative"), $("narrative"), { onError: _voiceErr($("voiceNarrative")) });
+// The patient's language, not the nurse's: a nurse dictating a Hindi
+// patient's words records them in Hindi and the server translates, exactly as
+// it would at the kiosk. Everything else a nurse dictates stays English.
+const _patientLang = () => (state && state.language) || "en-IN";
+
+attachVoiceInput($("voiceNarrative"), $("narrative"),
+  { getLang: _patientLang, onError: _voiceErr($("voiceNarrative")) });
 attachClearButton($("clearNarrative"), $("narrative"));
 
-attachVoiceInput($("voiceReply"), $("reply"), { onError: _voiceErr($("voiceReply")) });
+attachVoiceInput($("voiceReply"), $("reply"),
+  { getLang: _patientLang, onError: _voiceErr($("voiceReply")) });
 attachClearButton($("clearReply"), $("reply"));
+
+$("p_lang").addEventListener("change", async () => {
+  busy(true);
+  try {
+    render(await api("/api/language", { language: $("p_lang").value }));
+    if (nextStep) await askNext();   // a question already on screen is re-worded; none is started
+  } catch (e) { alert(e.message); } finally { busy(false); }
+});
 
 attachVoiceInput($("voiceOvNote"), $("ovNote"), { onError: _voiceErr($("voiceOvNote")) });
 attachClearButton($("clearOvNote"), $("ovNote"));
@@ -759,6 +791,10 @@ attachPhotoCapture($("btnTakePhoto"), $("btnUploadPhoto"), $("p_photo_upload"), 
 
 (async function boot() {
   TARGET = await api("/api/targets");
+  // Only what the server can actually do: English alone until a Sarvam key is set.
+  const { languages } = await api("/api/languages");
+  $("p_lang").innerHTML = languages.map(l =>
+    `<option value="${l.code}">${l.english}${l.code === "en-IN" ? "" : " · " + l.native}</option>`).join("");
   const checks = await api("/api/checks");
   $("obsCheck").innerHTML = checks.map(c =>
     `<option value="${c.id}">${c.text} — ${c.source}</option>`).join("");

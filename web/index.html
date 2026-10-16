@@ -91,6 +91,11 @@
   .said{font-size:14.5px;padding:11px 13px;background:var(--surface-2);
     border-left:2px solid var(--accent);border-radius:2px;margin-bottom:9px}
   .said:last-child{margin-bottom:0}
+  .said-en{display:block;margin-top:5px;font-size:12.5px;color:var(--ink-dim)}
+  .said-en b{font-family:var(--mono);font-size:10px;letter-spacing:.08em;text-transform:uppercase;
+    color:var(--ink-faint);font-weight:500;margin-right:6px}
+  .next-native{font-size:15px;padding:8px 10px;border-left:2px solid var(--accent);
+    background:var(--surface);border-radius:2px}
 
   .check{display:grid;grid-template-columns:1fr auto;gap:3px 12px;padding:10px 0;
     border-bottom:1px solid var(--line-soft)}
@@ -193,6 +198,8 @@
   .in-w{font-family:var(--mono);font-size:11px;color:var(--ink-faint)}
   .in-c{font-family:var(--mono);font-size:10.5px;letter-spacing:.06em;text-transform:uppercase;margin-top:2px;display:block}
   .in-meta{font-size:11.5px;color:var(--ink-faint);margin-top:3px}
+  .in-flag{display:block;margin-top:4px;font-family:var(--mono);font-size:10.5px;
+    letter-spacing:.04em;color:var(--orange);font-weight:600}
   .in[data-c=RED]{border-left-color:var(--red)}
   .in[data-c=ORANGE]{border-left-color:var(--orange)}
   .in[data-c=YELLOW]{border-left-color:var(--yellow)}
@@ -370,6 +377,9 @@
                 <button type="button" id="clearId" class="clear-btn">Clear</button>
               </div>
             </label>
+            <label><span class="lbl">Patient's language</span>
+              <select id="p_lang"><option value="en-IN">English</option></select>
+            </label>
           </div>
           <div class="vrow">
             <span class="why" id="recordNote">No record looked up yet.</span>
@@ -513,6 +523,7 @@
           <div class="next" id="next" hidden>
             <div class="next-k"><span>Next observation</span><span class="actor" id="nextActor"></span></div>
             <div class="next-q" id="nextQ"></div>
+            <div class="next-native" id="nextNative" hidden></div>
             <div class="next-why" id="nextWhy" hidden></div>
             <div id="pending"></div>
             <div id="answerBox" hidden>

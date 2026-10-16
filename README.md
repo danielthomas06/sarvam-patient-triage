@@ -10,7 +10,7 @@ and traces back to the exact words (or pixels) that produced it.
 ```bash
 pip install -r requirements.txt
 python serve.py                       # the live app -- http://localhost:8000
-python -m pytest tests/ -q            # 216 tests, none of which call a model
+python -m pytest tests/ -q            # 275 tests, none of which call a model
 python run_sim.py --all               # evaluation: headline, sensitivity, surge, ablation
 python scripts/run_demo_dataset.py    # 18 patients, twice (normal + 3x surge), scored
 ```
@@ -93,8 +93,11 @@ which is recorded separately and only for genuinely optional processing
 Audio is discarded after extraction; only the cited spans are retained.
 Audit events are retained per the NHS records retention schedule, and the
 engine never calls out with the local model tier — no narrative leaves the
-building at all. Run `python demo_cases.py` to see this printed in full,
-alongside a live override.
+building at all, **with one exception: an Indian-language session sends that
+patient's audio and text to Sarvam AI's cloud** (see *Indian languages*
+below, and note that India is not the UK — a UK deployment would need a lawful
+transfer mechanism for that, which this prototype does not have). Run
+`python demo_cases.py` to see this printed in full, alongside a live override.
 
 > "Adoption & change management — how you'd get a fatigued, time-pressured
 > staff to actually trust and use the tool rather than work around it."
@@ -181,6 +184,8 @@ voice only ever fills the same text box typing would have.
 | `local_stt.py` | Local speech-to-text (Vosk) — the offline fallback voice tier |
 | `vision.py` | Photo → proposed caption + candidate check — hosted or local vision model, never a diagnosis |
 | `identity_extract.py` | One spoken self-introduction → name/age/sex, for the kiosk's single-utterance check-in |
+| `sarvam.py` | Indian-language speech-to-text, translation and text-to-speech over Sarvam AI's API — stdlib only, key from the environment, never logged |
+| `question_bank.py` | Reviewable, pre-translated wording of every question a kiosk asks, for non-English sessions |
 | `news2.py` | Adult vital-sign scoring — a lookup table, refuses children and pregnancy |
 | `belief.py` | The shared belief state. Immutable; every write returns a new one |
 | `engine.py` | Category from confirmed positives; probability of each category |
@@ -232,6 +237,67 @@ Two tiers, tried in order:
 Speech only ever fills the same box typing would have; nothing is ever
 auto-submitted from voice, and a misheard word is one click to clear and
 retry (`attachClearButton` pairs with every mic button).
+
+## Indian languages (Hindi, Tamil, Malayalam)
+
+A patient can pick **हिन्दी, தமிழ், or മലയാളം** on the kiosk and then speak,
+hear and be asked questions in it. Powered by [Sarvam AI](https://docs.sarvam.ai),
+and **off unless `SARVAM_API_KEY` is set** — without a key the picker simply
+isn't shown and nothing changes for English.
+
+```
+patient speaks Tamil ──► Saaras speech-to-text ──► Tamil text (the record of truth)
+                                                        │
+                                              Sarvam-Translate ──► English
+                                                        │
+                                  the same guarded extraction as any English patient
+                                                        │
+kiosk question ◄── Bulbul voice ◄── translated reviewed question ◄── the engine's next check
+```
+
+**The boundary still holds, and translation adds one new way to be wrong** — a
+mistranslated "no chest pain" is exactly the silent-corruption case this
+system is built around. So:
+
+- The patient's **own words are always kept** next to the English
+  (`transcript_native`), the nurse screen shows both with the English labelled
+  *understood as*, and the translation is a visible event in the hash-chained
+  audit ledger.
+- **Questions use reviewed wording only.** In a non-English session the English
+  is always the protocol's own reviewed question, never model-generated
+  (the leading-question vetting only works on English), and what the patient
+  hears is that exact sentence translated *ahead of time* into
+  `data/question_bank.json`, where a native speaker can read it before any
+  patient does. A live (cached) translation is only the fallback, and the bank
+  records `"reviewed": false` until a human says otherwise.
+- **If translation is down, the patient is not silently scored.** Their words
+  still go through untranslated, but the keyword tier can't read Hindi, so such
+  a patient can look Non-urgent purely because nothing was understood. The
+  nurse queue flags them — *"Not translated — read their own words"* — rather
+  than let a quiet BLUE stand in for "nobody has read this". Whether such a
+  patient should instead get an automatic category floor is a clinical-policy
+  call this prototype deliberately doesn't make.
+- English audio never goes to Sarvam, even with a key set: English keeps its
+  local path (Web Speech API → Vosk).
+
+```bash
+export SARVAM_API_KEY=...                     # never in a file in the repo
+python scripts/build_question_bank.py         # one-off: translate the kiosk's questions (~72 calls)
+# then have a native speaker read data/question_bank.json before real patients hear it
+```
+
+**Privacy.** Unlike every other tier, this one sends audio and text to a third
+party's cloud. Sarvam's docs say retention is *indefinite until a workspace
+owner sets it* — set **zero retention** and switch off **model training** in
+their dashboard — and they don't state where data is hosted. See the
+jurisdiction note above before using this with real patients.
+
+Limits worth knowing: recordings auto-stop at 28 s (Sarvam's REST cap is 30 s);
+spoken questions cover these three languages with the `bulbul:v3` voice (v4-flash
+has no Malayalam); the free-tier rate limits are shared across the whole account,
+which matters under a surge with several kiosks; and the kiosk's own labels and
+buttons are still English — only the language picker, the questions and the
+speech are localised.
 
 ## Photo capture
 
@@ -472,6 +538,12 @@ Under-triage 7.5% → 0.0%, deteriorations missed 51 → 5, Very urgent wait
 | `OLLAMA_VISION_MODEL` | `qwen2.5vl:7b` | local vision model |
 | `OLLAMA_TIMEOUT` | `180` | seconds before a local call gives up |
 | `VOSK_MODEL_PATH` | `models/vosk-model-small-en-us-0.15` | local speech-to-text model directory |
+| `SARVAM_API_KEY` | unset | turns on Hindi/Tamil/Malayalam (speech, translation, voice). Environment only — never a file in the repo |
+| `SARVAM_STT_MODEL` | `saaras:v4` | Sarvam speech-to-text model |
+| `SARVAM_TRANSLATE_MODEL` | `sarvam-translate:v1` | Sarvam translation model (covers all 22 scheduled languages) |
+| `SARVAM_TTS_MODEL` | `bulbul:v3` | Sarvam voice model — `v3`, not `v4-flash`, because only `v3` has Malayalam |
+| `SARVAM_TTS_SPEAKER` | `priya` | Sarvam voice name |
+| `SARVAM_TIMEOUT` | `30` | seconds before a Sarvam call gives up |
 
 ## Running this on another machine
 
@@ -494,7 +566,11 @@ export ANTHROPIC_API_KEY=sk-ant-...
 ollama pull qwen2.5:7b          # text extraction
 ollama pull qwen2.5vl:7b        # photo captioning
 
-# Local voice fallback (optional) -- only needed if you want offline voice
+# Indian languages (optional) -- Hindi / Tamil / Malayalam via Sarvam AI
+export SARVAM_API_KEY=...        # PowerShell: $env:SARVAM_API_KEY = "..."   (or setx, for new terminals)
+python scripts/build_question_bank.py    # one-off, ~72 translation calls; then have a native speaker review data/question_bank.json
+
+# Local voice fallback (optional) -- only needed if you want offline English voice
 pip install vosk
 curl -LO https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip
 unzip vosk-model-small-en-us-0.15.zip -d models/
@@ -511,7 +587,7 @@ python serve.py
 **Verify it.**
 
 ```bash
-python -m pytest tests/ -q                 # 216 tests, ~4s, no model calls
+python -m pytest tests/ -q                 # 275 tests, ~10s, no model calls
 python scripts/run_demo_dataset.py         # 18 patients through the real API, scored
 ```
 
@@ -526,6 +602,15 @@ python serve.py
 
 ## Not built yet
 
+- **Indian-language support is Phase 1, and has not yet run against a live
+  Sarvam key.** Every call is unit-tested with the network replaced, and the
+  real routes were exercised against Sarvam with an invalid key (they reach it
+  and fail cleanly) — but endpoint and field names follow Sarvam's published
+  docs, not a successful live call. Expect to fix a field name on first contact.
+  Still to do: live word-by-word captions (needs a WebSocket relay; the REST
+  route is record-then-transcribe), translated kiosk labels and buttons, a
+  native-speaker review of the question bank, more languages, and a decision on
+  whether an untranslatable patient should get an automatic category floor.
 - **Real push delivery for critical patients**, beyond sort-to-top-of-queue
   and a visual flash on the nurse screen — no SMS/pager/audible alert.
 - **Deployment beyond `localhost`.** Voice and camera capture both require

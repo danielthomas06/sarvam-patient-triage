@@ -53,6 +53,8 @@ from triage import ollama as _ollama
 from triage import local_stt as _stt
 from triage import identity_extract as _identity
 from triage import vision as _vision
+from triage import sarvam as _sarvam
+from triage import question_bank as _qbank
 
 WEB = pathlib.Path(__file__).parent / "web"
 
@@ -122,6 +124,21 @@ class Encounter:
         self.belief = BeliefState(PROTOCOL)
         self.weights: dict[str, float] = {}
         self.transcript: list[str] = []
+        """Always English -- it is what the extraction models read and what
+        their verbatim-quote guard checks against. For a non-English patient
+        it is the TRANSLATION; their own words live in transcript_native."""
+        self.transcript_native: list[str] = []
+        """Parallel to `transcript`: the patient's original words where a
+        translation happened, "" where there was nothing to translate. Kept so
+        a mistranslation is visible to the nurse, not just silently believed."""
+        self.language = _sarvam.ENGLISH
+        self.untranslated = False
+        """True once any of this patient's words reached extraction UNtranslated
+        (translator down). Sticky on purpose: that earlier text stays unread
+        even if a later sentence translates fine. The keyword tier cannot read
+        Hindi at all, so such a patient can look Non-urgent purely because the
+        system understood nothing -- the nurse queue flags it rather than let a
+        quiet BLUE stand in for "nobody has read this"."""
         self.ledger = Ledger(ref)
         self.tier = "none"
         self.rejected: list[str] = []
@@ -203,8 +220,56 @@ class Encounter:
         entry["status"] = "rejected"
         return entry
 
+    def set_language(self, code: str) -> None:
+        """Which language this patient speaks and is spoken to in. Changes how
+        their words reach the extraction models (translated) and how the
+        system's questions reach them (reviewed wording, translated, spoken);
+        never what the engine does with the resulting findings."""
+        if not _sarvam.is_supported(code):
+            raise ValueError(f"unsupported language {code!r}")
+        self.language = code
+        self.ledger.append(EventKind.OBSERVED, "reception", check="language",
+                           value=code, quote=_sarvam.LANGUAGES[code]["english"])
+
+    def _to_english(self, text: str) -> tuple[str, str, str | None]:
+        """(english, original_if_translated, fallback_note).
+
+        Plain ASCII, or any text in an English session, passes through
+        untouched. Otherwise it is translated -- and the original is kept and
+        returned so the caller can store it next to the translation. If the
+        translator is unreachable the patient's own words go to extraction
+        as-is, with a note: a model can still read some Hindi, and the quote
+        guard still holds against whatever text it was actually given, which
+        beats silently dropping what the patient said.
+        """
+        if self.language == _sarvam.ENGLISH or not _sarvam.needs_translation(text):
+            return text, "", None
+        try:
+            english = _sarvam.translate(text, self.language, _sarvam.ENGLISH)
+        except _sarvam.Unavailable as exc:
+            self.untranslated = True
+            return text, "", (f"translation unavailable ({exc}) -- extraction used the "
+                              f"patient's original words")
+        self.ledger.append(EventKind.OBSERVED, "system", check="translation",
+                           value=self.language, quote=f"{text} => {english}")
+        return english, text, None
+
+    def _question_native(self, check_id: str, english: str) -> str | None:
+        """The question in the patient's language: the reviewed bank first, a
+        live (cached) translation only if the bank has nothing, None if neither
+        works -- in which case the kiosk can only show the English."""
+        banked = _qbank.lookup(check_id, self.language, english)
+        if banked:
+            return banked
+        try:
+            return _sarvam.translate(english, _sarvam.ENGLISH, self.language)
+        except _sarvam.Unavailable:
+            return None
+
     def add_narrative(self, text: str) -> None:
+        text, native, note = self._to_english(text)
         self.transcript.append(text)
+        self.transcript_native.append(native)
         joined = "\n".join(self.transcript)
         result = seed(joined, PROTOCOL) if USE_MODEL else keyword_seed(joined, PROTOCOL)
 
@@ -222,6 +287,8 @@ class Encounter:
         self.tier = result.tier
         self.rejected = list(result.rejected)
         self.fallbacks = list(getattr(result, 'fallbacks', []))
+        if note:
+            self.fallbacks.append(note)
         self._sync_board()
 
     def set_identity(self, values: dict) -> dict:
@@ -402,6 +469,15 @@ class Encounter:
         return PAIN_LOCALITY.get(leading[0], "central")
 
     def answer(self, check_id: str, reply: str) -> str:
+        # parse()/keyword_parse() and the denial guard only know English words
+        # for "no" and "not" -- a Tamil "இல்லை" would read as an unclear
+        # answer, or worse. Translate first; the ledger keeps both, so the
+        # record shows what was said as well as what was understood.
+        reply, native, note = self._to_english(reply)
+        said = f"{reply} [said: {native}]" if native else reply
+        if note:
+            self.fallbacks.append(note)
+
         if check_id in self.PAIN_CHECK_IDS:
             score = self._pain_score(reply)
             if score is not None:
@@ -416,7 +492,7 @@ class Encounter:
                         cid, outcome, Evidence(reply, "patient"))
                     self.ledger.append(EventKind.OBSERVED, "patient",
                                        check=cid, value=outcome.value,
-                                       quote=f"{reply} (scored {score}/10)")
+                                       quote=f"{said} (scored {score}/10)")
                 return "true" if score >= 1 else "false"
             # No number in the reply -- fall through and let the parser try.
 
@@ -434,7 +510,7 @@ class Encounter:
             return "unclear"
         self.belief = self.belief.record(check_id, outcome, evidence)
         self.ledger.append(EventKind.OBSERVED, "patient",
-                           check=check_id, value=outcome.value, quote=reply)
+                           check=check_id, value=outcome.value, quote=said)
         return outcome.value
 
     def record_override(self, clinician: str, category: str, reason: str, note: str) -> None:
@@ -616,12 +692,24 @@ class Encounter:
             # exactly today's behaviour.
             question = render(check_id, PROTOCOL, age=self.age) if USE_MODEL else d.question
 
+        # Non-English session: the model may still have helped choose WHICH
+        # check to ask (that is a ranking, and the ranking is guarded), but
+        # the words are always the protocol's reviewed English -- the leading-
+        # question vetting that protects a generated English question cannot
+        # be run on a Tamil sentence, so a generated one is never translated
+        # and spoken to a patient. See triage/question_bank.py.
+        question_native = None
+        if self.language != _sarvam.ENGLISH:
+            question = d.question
+            question_native = self._question_native(check_id, question)
+
         self.asked[check_id] = question
         self.pending = check_id
         return {
             "check": check_id, "text": d.text, "actor": "patient",
             "question": question, "why": why, "value": round(value, 3),
             "pending": pending,
+            "language": self.language, "question_native": question_native,
         }
 
     def state(self) -> dict:
@@ -652,6 +740,9 @@ class Encounter:
             "tier": self.tier,
             "use_model": USE_MODEL,
             "transcript": self.transcript,
+            "transcript_native": self.transcript_native,
+            "language": self.language,
+            "untranslated": self.untranslated,
             "checks": checks,
             "rejected": self.rejected[:6],
             "fallbacks": self.fallbacks[:3],
@@ -804,6 +895,7 @@ def queue_rows() -> list[dict]:
                 "category": d.category.name, "label": d.category.label,
                 "critical": d.category <= Category.ORANGE,
                 "stopped": stopped,
+                "language": e.language, "untranslated": e.untranslated,
             })
     rows.sort(key=lambda r: (not r["critical"], r["waited_minutes"]))
     return rows
@@ -894,6 +986,37 @@ def session(ref: str):
 # http
 # ---------------------------------------------------------------------------
 
+def transcribe_audio(audio: bytes, lang: str) -> tuple[int, dict]:
+    """(http status, json body) for POST /api/transcribe.
+
+    English keeps its existing, fully local path (Vosk): nothing about an
+    English patient's audio leaves the machine just because a Sarvam key
+    happens to be set. Any other language goes to Sarvam, because there is no
+    local model for it -- and if Sarvam can't do it, that's an honest 503
+    the kiosk turns into "please type", not a guess.
+    """
+    if lang != _sarvam.ENGLISH:
+        if not audio:
+            return 400, {"text": "", "error": "no audio received"}
+        if not _sarvam.is_supported(lang):
+            return 400, {"text": "", "error": f"language {lang!r} isn't offered"}
+        try:
+            return 200, {"text": _sarvam.transcribe(audio, lang), "language": lang,
+                         "engine": "sarvam"}
+        except _sarvam.Unavailable as exc:
+            return 503, {"text": "", "error": str(exc)}
+
+    ok, detail = _stt.available()
+    if not ok:
+        return 503, {"text": "", "error": f"local transcription unavailable -- {detail}"}
+    if not audio:
+        return 400, {"text": "", "error": "no audio received"}
+    text = _stt.transcribe_wav(audio)
+    if text is None:
+        return 400, {"text": "", "error": "audio wasn't readable as mono 16-bit PCM WAV"}
+    return 200, {"text": text, "language": lang, "engine": "vosk"}
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args):        # quiet; the console is for the demo
         pass
@@ -958,6 +1081,17 @@ class Handler(BaseHTTPRequestHandler):
         if self.path.startswith("/api/queue"):
             return self._json(queue_rows())
 
+        if self.path.startswith("/api/languages"):
+            # Only offer what can actually work: with no Sarvam key there is no
+            # way to hear, translate or speak a non-English language, and a
+            # picker full of dead options is worse than no picker.
+            offered = [c for c in _sarvam.LANGUAGES
+                       if c == _sarvam.ENGLISH or _sarvam.configured()]
+            return self._json({
+                "sarvam": _sarvam.configured(),
+                "languages": [{"code": c, **_sarvam.LANGUAGES[c]} for c in offered],
+            })
+
         if self.path.startswith("/api/targets"):
             return self._json({c.name: c.target_minutes for c in Category})
 
@@ -981,7 +1115,11 @@ class Handler(BaseHTTPRequestHandler):
                     detail = f"reachable but the call failed: {exc}"
                     reachable = False
             vosk_ok, vosk_detail = _stt.available()
+            sarvam_ok, sarvam_detail = _sarvam.available()
             return self._json({
+                "sarvam_configured": sarvam_ok,
+                "sarvam_detail": sarvam_detail,
+                "question_bank_reviewed": _qbank.reviewed(),
                 "hosted_key_set": bool(os.environ.get("ANTHROPIC_API_KEY")),
                 "hosted_model": os.environ.get("TRIAGE_MODEL", "claude-opus-5"),
                 "ollama_host": _ollama.HOST,
@@ -1051,17 +1189,8 @@ class Handler(BaseHTTPRequestHandler):
         if self.path.startswith("/api/transcribe"):
             length = int(self.headers.get("Content-Length") or 0)
             audio = self.rfile.read(length) if length else b""
-            ok, detail = _stt.available()
-            if not ok:
-                return self._json(
-                    {"text": "", "error": f"local transcription unavailable -- {detail}"}, 503)
-            if not audio:
-                return self._json({"text": "", "error": "no audio received"}, 400)
-            text = _stt.transcribe_wav(audio)
-            if text is None:
-                return self._json(
-                    {"text": "", "error": "audio wasn't readable as mono 16-bit PCM WAV"}, 400)
-            return self._json({"text": text})
+            status, payload = transcribe_audio(audio, self._qs("lang") or _sarvam.ENGLISH)
+            return self._json(payload, status)
 
         # Raw image bytes, not JSON -- same reason as /api/transcribe above.
         # ref travels in the query string (?ref=...) since there is no JSON
@@ -1100,12 +1229,35 @@ class Handler(BaseHTTPRequestHandler):
             # fills its own form fields with whatever comes back; nothing
             # here is recorded until the patient hits Continue.
             text = (body.get("text") or "").strip()
-            result = _identity.extract_identity(text, use_model=USE_MODEL)
+            english = text
+            language = body.get("language") or _sarvam.ENGLISH
+            if language != _sarvam.ENGLISH and _sarvam.needs_translation(text):
+                # A name comes back in Latin letters, which is what the record
+                # and the nurse screen use; the patient still sees and can fix
+                # every field it fills in before anything is submitted.
+                try:
+                    english = _sarvam.translate(text, language, _sarvam.ENGLISH)
+                except _sarvam.Unavailable:
+                    pass          # extract from the original; may well find nothing
+            result = _identity.extract_identity(english, use_model=USE_MODEL)
             return self._json({
                 "name": result.name, "age": result.age_years,
                 "age_months": result.age_months, "sex": result.sex,
-                "tier": result.tier, "heard": result.heard,
+                "tier": result.tier, "heard": text,
             })
+
+        if self.path == "/api/tts":
+            # Speaks a question in the patient's language. Tied to a live
+            # session so this can't be used as an open text-to-speech proxy
+            # that spends the Sarvam account's credits and rate limit.
+            ref = body.get("ref", "")
+            if _lookup(ref) is None:
+                return self._no_such_patient(NoSuchPatient(ref))
+            try:
+                wav = _sarvam.synthesize(body.get("text") or "", body.get("language") or "")
+            except _sarvam.Unavailable as exc:
+                return self._json({"error": str(exc)}, 503)
+            return self._send(200, wav, "audio/wav")
 
         if self.path == "/api/tier":
             with GLOBAL_LOCK:
@@ -1138,6 +1290,13 @@ class Handler(BaseHTTPRequestHandler):
 
                 if self.path == "/api/identity":
                     enc.set_identity(body)
+                    return self._json(enc.state())
+
+                if self.path == "/api/language":
+                    try:
+                        enc.set_language(body.get("language") or "")
+                    except ValueError as exc:
+                        return self._json({"error": str(exc)}, 400)
                     return self._json(enc.state())
 
                 if self.path == "/api/vitals":

@@ -49,10 +49,57 @@ function showError(fieldId, message) {
 async function startSession() {
   const data = await api("/api/patient/new", { origin: "kiosk" });
   PATIENT_REF = data.ref;
+  PATIENT_LANG = "en-IN";          // a fresh session always starts in English
+  renderLanguagePicker();
   const url = new URL(window.location);
   url.searchParams.set("patient", PATIENT_REF);
   window.history.replaceState({}, "", url);
   show("stageIdentity");
+}
+
+// ---------------------------------------------------------------- language
+// The picker only exists when the server says it can actually hear, translate
+// and speak more than English -- see /api/languages. What it changes: how this
+// patient's speech is transcribed, and which language questions are shown and
+// spoken in. It changes nothing about how anyone is triaged; the engine reads
+// the same English findings either way. The rest of this page's labels are
+// still English -- localising them is a separate, larger job.
+
+let PATIENT_LANG = "en-IN";
+let OFFERED_LANGUAGES = [];
+
+async function loadLanguages() {
+  try {
+    const r = await fetch("/api/languages");
+    OFFERED_LANGUAGES = (await r.json()).languages || [];
+  } catch {
+    OFFERED_LANGUAGES = [];
+  }
+  renderLanguagePicker();
+}
+
+function renderLanguagePicker() {
+  const box = $("langButtons");
+  $("langPicker").hidden = OFFERED_LANGUAGES.length < 2;
+  box.innerHTML = "";
+  for (const lang of OFFERED_LANGUAGES) {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "lang-btn";
+    b.textContent = lang.native;
+    b.lang = lang.code;
+    b.setAttribute("aria-pressed", String(lang.code === PATIENT_LANG));
+    b.addEventListener("click", async () => {
+      try {
+        await api("/api/language", { language: lang.code });
+        PATIENT_LANG = lang.code;
+        renderLanguagePicker();
+      } catch (e) {
+        if (e.message !== "restarted") showError("errIdentity", "That language isn't available right now.");
+      }
+    });
+    box.appendChild(b);
+  }
 }
 
 // ---------------------------------------------------------------- identity
@@ -146,12 +193,26 @@ async function askNext() {
   // Deliberately narrow: only the question text (and the check id needed to
   // submit a reply against) reach the page. next.why and next.pending both
   // exist in the API response and are never read here.
-  $("k_question").textContent = next.question;
+  LAST_QUESTION = next;
+  // In the patient's language when there is one; English otherwise (including
+  // when the translation service is down, which beats a blank question box).
+  $("k_question").textContent = next.question_native || next.question;
   $("k_question").dataset.check = next.check;
   $("k_reply").value = "";
   show("stageQuestions");
   $("k_reply").focus();
-  speak(next.question);   // read aloud for a patient who can't read the screen
+  speakQuestion(next);   // read aloud for a patient who can't read the screen
+}
+
+let LAST_QUESTION = null;
+
+function speakQuestion(next) {
+  if (!next) return;
+  if (PATIENT_LANG !== "en-IN" && next.question_native) {
+    speakNative(PATIENT_REF, next.question_native, PATIENT_LANG);   // server voice, browser voice as fallback
+  } else {
+    speak(next.question);
+  }
 }
 
 async function sendReply() {
@@ -174,7 +235,7 @@ $("k_reply").addEventListener("keydown", (e) => {
 });
 
 $("btnFinish").addEventListener("click", () => show("stageDone"));
-$("btnReplay").addEventListener("click", () => speak($("k_question").textContent));
+$("btnReplay").addEventListener("click", () => speakQuestion(LAST_QUESTION));
 
 // ---------------------------------------------------------------- voice
 // Never the only way to answer -- the text boxes above always still work.
@@ -184,11 +245,13 @@ $("btnReplay").addEventListener("click", () => speak($("k_question").textContent
 // not a select-all-delete.
 
 attachVoiceInput($("voiceNarrative"), $("k_narrative"), {
+  getLang: () => PATIENT_LANG,
   onError: () => showError("errNarrative", "Voice input isn't available right now — please type instead."),
 });
 attachClearButton($("clearNarrative"), $("k_narrative"));
 
 attachVoiceInput($("voiceReply"), $("k_reply"), {
+  getLang: () => PATIENT_LANG,
   onError: () => showError("errQuestions", "Voice input isn't available right now — please type instead."),
 });
 attachClearButton($("clearReply"), $("k_reply"));
@@ -202,6 +265,7 @@ attachClearButton($("clearReply"), $("k_reply"));
 // left out of this: a misheard digit there could pull up the wrong person's
 // record, which is a different and worse failure than a misheard name.
 attachVoiceInput($("voiceIdentity"), $("k_identity_raw"), {
+  getLang: () => PATIENT_LANG,
   onError: () => showError("errIdentity", "Voice input isn't available right now — please type instead."),
   onFinal: async (transcript) => {
     if (!transcript.trim()) return;
@@ -209,7 +273,7 @@ attachVoiceInput($("voiceIdentity"), $("k_identity_raw"), {
     try {
       const r = await fetch("/api/extract_identity", {
         method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text: transcript }),
+        body: JSON.stringify({ text: transcript, language: PATIENT_LANG }),
       });
       const found = await r.json();
       if (found.name) $("k_name").value = found.name;
@@ -235,7 +299,8 @@ $("clearIdentity").addEventListener("click", () => showError("identityVoiceNote"
   if (urlRef) {
     PATIENT_REF = urlRef;
     try {
-      await api(`/api/state?ref=${encodeURIComponent(PATIENT_REF)}`);
+      const st = await api(`/api/state?ref=${encodeURIComponent(PATIENT_REF)}`);
+      PATIENT_LANG = (st.encounter && st.encounter.language) || "en-IN";
       show("stageIdentity");   // a resumed session still starts at check-in;
                                 // nothing here re-derives which stage it was on
     } catch (e) {
@@ -244,4 +309,5 @@ $("clearIdentity").addEventListener("click", () => showError("identityVoiceNote"
   } else {
     await startSession();
   }
+  await loadLanguages();
 })();
